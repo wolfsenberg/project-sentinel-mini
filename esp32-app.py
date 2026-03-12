@@ -90,6 +90,9 @@ DOT_STYLE = (
 # ── Administrator PIN (SHA-256 hash of 'cornersteel123') ──────────────
 SUPERADMIN_PIN_HASH = "b63ae1e3da0e2b5c62acd69773bb231aac6659b8a214ea466e5e275ce33f79a7"
 
+# ── Tags that route to LIVE LOG (access/door events) ────────────────
+LIVE_LOG_TAGS = {"[OK]", "[DENY]", "[BLOCK]", "[TAP]", "[SYNC]", "[RECV]", "[DOOR]"}
+
 # ── Mosquitto Config Content ─────────────────────────────────────────
 MOSQUITTO_CONF = """# Sentinel MQTT Broker Configuration
 listener 1883 0.0.0.0
@@ -344,6 +347,42 @@ class Database:
             except Exception:
                 return None
 
+    def force_all_tapout(self):
+        """Set all users whose last successful action is TAPIN to TAPOUT.
+        Returns list of (uid, name) pairs that were forced out."""
+        with self.lock:
+            forced = []
+            try:
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        # Find all UIDs whose most recent SUCCESS action is TAPIN
+                        cur.execute("""
+                            SELECT a.uid, c.name
+                            FROM access_log a
+                            INNER JOIN (
+                                SELECT uid, MAX(timestamp) AS latest
+                                FROM access_log
+                                WHERE result='SUCCESS'
+                                GROUP BY uid
+                            ) b ON a.uid = b.uid AND a.timestamp = b.latest
+                            LEFT JOIN cards c ON a.uid = c.uid
+                            WHERE a.action='TAPIN' AND a.result='SUCCESS'
+                        """)
+                        rows = cur.fetchall()
+                        for row in rows:
+                            uid = row["uid"]
+                            name = row.get("name") or "Unknown"
+                            cur.execute(
+                                "INSERT INTO access_log (uid, source, action, result) "
+                                "VALUES (%s, %s, %s, %s)",
+                                (uid, "SYSTEM", "TAPOUT", "SUCCESS"),
+                            )
+                            forced.append((uid, name))
+                    conn.commit()
+            except Exception:
+                pass
+            return forced
+
 
 # =====================================================================
 #  SERIAL MONITOR
@@ -511,9 +550,11 @@ class SentinelMonitor:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.log_queue.put({"time": ts, "source": source,
                             "message": message, "tag": tag})
-        with self.log_lock:
-            with open(self.log_file, "a") as f:
-                f.write(f"[{ts}] [{source}] {message}\n")
+        # Only auto-save LIVE LOG entries (access events) to file
+        if tag in LIVE_LOG_TAGS:
+            with self.log_lock:
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{ts}] [{source}] {tag} {message}\n")
 
     def parse_message(self, source, line):
         line = line.strip()
@@ -539,7 +580,7 @@ class SentinelMonitor:
         handler = {
             "SYSTEM": handle_system,
             "STATUS": lambda: self.log(source, body, "[STATUS]"),
-            "DOOR":   lambda: self.log(source, body, "[DOOR]"),
+            "DOOR":   lambda: self._handle_door(source, body),
             "LOG":    lambda: self._parse_log(source, body),
             "TAP":    lambda: self._parse_tap(source, body),
             "SYNC":   lambda: self._parse_sync(source, body),
@@ -635,6 +676,21 @@ class SentinelMonitor:
         parts = body.split(",")
         if len(parts) >= 3:
             self.log(source, f"{parts[1]} | UID: {parts[0]} | {parts[2]}", "[RECV]")
+
+    def _handle_door(self, source, body):
+        """Handle DOOR: messages — log important events to LIVE LOG, countdown to DEVICE STATUS."""
+        if body.startswith("COUNTDOWN_"):
+            self.log(source, body, "[STATUS]")  # countdown goes to DEVICE STATUS, not LIVE LOG
+        else:
+            self.log(source, body, "[DOOR]")    # UNLOCKING, LOCKED, MANUAL_UNLOCK → LIVE LOG
+        if body == "MANUAL_UNLOCK" and self.db:
+            forced = self.db.force_all_tapout()
+            if forced:
+                for uid, name in forced:
+                    self.log("SYSTEM", f"FORCED TAPOUT | {name} ({uid}) | MANUAL BUTTON", "[DOOR]")
+                self.log("SYSTEM", f"Manual button: {len(forced)} user(s) forced OUT", "[DOOR]")
+            else:
+                self.log("SYSTEM", "Manual button: No users currently IN", "[DOOR]")
 
     def _read_port(self, ser, label):
         while self.running:
@@ -1172,9 +1228,6 @@ class SentinelApp(QMainWindow):
             self.mqtt_lbl.setText("MQTT: WAITING")
             self.mqtt_lbl.setStyleSheet(f"color: {WARNING};")
 
-    # Tags that go to LIVE LOG (access events)
-    LIVE_LOG_TAGS = {"[OK]", "[DENY]", "[BLOCK]", "[TAP]", "[SYNC]", "[RECV]"}
-
     def _append_log(self, entry):
         if entry.get("separator"):
             self.log_text.append("")
@@ -1183,7 +1236,7 @@ class SentinelApp(QMainWindow):
         tag = entry.get("tag", "")
 
         # Route to the correct panel
-        if tag in self.LIVE_LOG_TAGS:
+        if tag in LIVE_LOG_TAGS:
             target = self.log_text
         else:
             target = self.device_status_text

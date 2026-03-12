@@ -11,7 +11,8 @@
 #define BUTTON_PIN 34            // Manual unlock button (input-only GPIO)
 #define LED_PIN 2                // Built-in LED for countdown blink
 #define DOOR_OPEN_TIME 3000      // 3 seconds
-#define MANUAL_OPEN_TIME 7000    // 7 seconds for manual button
+#define MANUAL_OPEN_TIME 10000   // 10 seconds for manual button
+#define BUTTON_COOLDOWN  5000    // 5 seconds between button presses
 
 // ── WiFi SoftAP Settings ──
 const char* AP_SSID     = "SENTINEL_MASTER";
@@ -42,6 +43,8 @@ bool doorIsOpening = false;
 bool needRebootAfterLock = false;
 
 unsigned long lastMqttReconnect = 0;
+unsigned long lastButtonPress = 0;
+bool lastButtonState = false;       // for rising-edge detection
 
 // ==================== SERIAL COMMAND PROCESSING ====================
 void processSerialCommands() {
@@ -164,38 +167,41 @@ void checkDoorTimer() {
 // ==================== MANUAL BUTTON UNLOCK ====================
 void checkManualButton() {
   if (doorIsOpening) return;  // already open, ignore
-  if (digitalRead(BUTTON_PIN) == LOW) {  // button pressed (active LOW)
-    delay(50);  // debounce
-    if (digitalRead(BUTTON_PIN) != LOW) return;  // false trigger
+
+  bool pressed = (digitalRead(BUTTON_PIN) == HIGH);  // ZX-SWITCH01 INEX active HIGH
+
+  // Only trigger on rising edge (LOW → HIGH), not while held or floating
+  if (pressed && !lastButtonState) {
+    lastButtonState = true;
+
+    // Cooldown: ignore if pressed again within 5 seconds
+    if (millis() - lastButtonPress < BUTTON_COOLDOWN) return;
 
     Serial.println("DOOR:MANUAL_UNLOCK");
 
-    // Shut down RFID to avoid conflicts
+    // Shut down RFID to avoid SPI conflicts during countdown
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
     rfid.PCD_SoftPowerDown();
     SPI.end();
 
-    // Cut relay power
-    digitalWrite(RELAY_PIN, LOW);
-
-    // 7-second countdown with LED blink
-    for (int i = 7; i >= 1; i--) {
-      esp_task_wdt_reset();  // keep watchdog happy
+    // 10-second countdown — blink the RELAY as indicator
+    for (int i = 10; i >= 1; i--) {
+      esp_task_wdt_reset();
       Serial.print("DOOR:COUNTDOWN_"); Serial.println(i);
 
-      // Blink LED: ON for 200ms, OFF for 800ms = 1 second per count
-      digitalWrite(LED_PIN, HIGH);
-      delay(200);
-      digitalWrite(LED_PIN, LOW);
+      // Relay OFF (door open) 800ms, then ON (click) 200ms
+      digitalWrite(RELAY_PIN, LOW);
       delay(800);
+      digitalWrite(RELAY_PIN, HIGH);
+      delay(200);
     }
 
-    // Re-lock door
+    // Re-lock (relay HIGH = locked)
     digitalWrite(RELAY_PIN, HIGH);
-    digitalWrite(LED_PIN, LOW);
     Serial.println("DOOR:LOCKED");
 
+    // Recover RFID reader
     delay(200);
     SPI.begin(18, 19, 23, 5);
     SPI.setFrequency(1000000);
@@ -204,6 +210,13 @@ void checkManualButton() {
     rfid.PCD_SoftPowerUp();
     delay(80);
     recoverRFID();
+
+    // Cooldown starts NOW (after door re-locked), not before countdown
+    lastButtonPress = millis();
+  }
+
+  if (!pressed) {
+    lastButtonState = false;  // reset when released
   }
 }
 
